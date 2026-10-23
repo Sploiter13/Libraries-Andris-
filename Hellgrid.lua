@@ -36,6 +36,11 @@ local Engine = {
     PitchSpeed = 1.6,
     MouseSensitivity = .0015,
     Outlines = true,
+    BuildBudget = .002,
+    TurnMargin = 0,
+    PlayerRadius = .2,
+    PlayerHeight = .55,
+    OutlineDistance = math.huge,
     Collision = true,
     MouseLook = true,
     BlockRobloxInput = true,
@@ -46,11 +51,10 @@ local Engine = {
 --constanst in here no need for local
 const maxPitch = math.rad(85)
 const maxFrameTime = .05
-const playerRadius = .2
-const playerHeight = .55
 const moveSubstep = .05
 const groundProbe = .03
-const groundBands = 48
+const groundBands = 16
+const cullMargin = math.rad(20)
 const toggleReleaseTime = .2
 const cylinderSides = 16
 const sphereRings = 6
@@ -60,40 +64,25 @@ const TURN_RIGHT = table.freeze({"E","Right","RightArrow","ArrowRight"})
 const lookup = table.freeze({"Up","UpArrow","ArrowUp"})
 const lookdown = table.freeze({"Down","DownArrow","ArrowDown"})
 
---local Keys = {}
---local PreviousCamera = {}
 const Keys = {}
 const PreviousCamera = {}
 
 --lowercase keys built once so isnamedown dont lower them
 const lowerkeys = {}
 
---no more making a new color3 every face
-const colorcache = {}
+const colorCache = {}
+local colorCacheFog = nil
 
 --scratch buffers reused every face
 const campointx = table.create(cylinderSides)
 const campointy = table.create(cylinderSides)
 const campointz = table.create(cylinderSides)
-
 const clippointx = table.create(cylinderSides + 1)
 const clippointy = table.create(cylinderSides + 1)
 const clippointz = table.create(cylinderSides + 1)
-const worldpoints = table.create(cylinderSides)
+const screenscratch = table.create(cylinderSides + 2)
 
---pools just reset the index each frame
-const pointpool = {}
-const itempool = {}
-const grouppool = {}
-const groundlist = {}
-const grouplist = {}
-
-local poolpointindex = 0
-local poolitemindex = 0
-local poolgroupindex = 0
-local groundcount = 0
-local groupcount = 0
-
+local DrawList = {}
 local lastUpdate = os.clock()
 local tickStart = os.clock()
 local tickLength = 1 / 60
@@ -106,12 +95,18 @@ local jumpBufferTimer = 0
 local stepOffset = 0
 local bobPhase = 0
 local renderCount = 0
+local renderTime = 0
+local prepareCount = 0
+local prepareTime = 0
+local lastBuildSeconds = 0
+local mouseSettleTicks = 3
+local turnRate = 0
 local updateCount = 0
 local lastDebugPrint = os.clock()
 local viewportWidth, viewportHeight = 1920, 1080
 local lastblockinput = nil
 
---plain locals is faster than the old view table
+--plain locals is faster than a table
 local viewx, viewy, viewz = 0, 0, 0
 local viewcosyaw, viewsinyaw = 1, 0
 local viewcospitch, viewsinpitch = 1, 0
@@ -123,21 +118,39 @@ local function Running()
     return _G.HellgridRun == runId
 end
 
---old rgb
---local function Rgb(color, shade)
---    return Color3.fromRGB(math.floor(math.clamp(color[1] * shade, 0, 255)), math.floor(math.clamp(color[2] * shade, 0, 255)), math.floor(math.clamp(color[3] * shade, 0, 255)))
---end
-
 local function Rgb(color, shade)
-    local r, g, b = color[1], color[2], color[3]
-    local bucket = math.floor(math.clamp(shade, 0, 1) * 128)
-    local key = bucket * 16777216 + math.floor(r) * 65536 + math.floor(g) * 256 + math.floor(b)
-    local hit = colorcache[key]
-    if hit ~= nil then return hit end
-    local s = bucket / 128
-    local made = Color3.fromRGB(math.floor(math.clamp(r * s, 0, 255)), math.floor(math.clamp(g * s, 0, 255)), math.floor(math.clamp(b * s, 0, 255)))
-    colorcache[key] = made
-    return made
+    return Color3.fromRGB(math.floor(math.clamp(color[1] * shade, 0, 255)), math.floor(math.clamp(color[2] * shade, 0, 255)), math.floor(math.clamp(color[3] * shade, 0, 255)))
+end
+
+local function Fogged(color, shade, fogColor, amount)
+    local keep = 1 - amount
+    return Color3.fromRGB(
+        math.floor(math.clamp(color[1] * shade * keep + fogColor[1] * amount, 0, 255)),
+        math.floor(math.clamp(color[2] * shade * keep + fogColor[2] * amount, 0, 255)),
+        math.floor(math.clamp(color[3] * shade * keep + fogColor[3] * amount, 0, 255))
+    )
+end
+
+local function CachedColor(color, light, amount)
+    local fogColor = Engine.FogColor
+    if fogColor ~= colorCacheFog then
+        table.clear(colorCache)
+        colorCacheFog = fogColor
+    end
+    local level = math.floor(light * 64 + .5)
+    local step = math.floor(amount * 256 + .5)
+    local byColor = colorCache[color]
+    if not byColor then
+        byColor = {}
+        colorCache[color] = byColor
+    end
+    local key = level * 257 + step
+    local cached = byColor[key]
+    if not cached then
+        cached = if fogColor then Fogged(color, level / 64, fogColor, step / 256) else Rgb(color, level / 64)
+        byColor[key] = cached
+    end
+    return cached
 end
 
 local function Outward(points, shapeCenter)
@@ -300,10 +313,23 @@ local function IsNameDown(first, second)
     return false
 end
 
+--this one needed the update loop to clear it
+--local function BlockBounds(block)
+--    local cachedlow = block.CacheLow
+--    if cachedlow ~= nil then
+--        return cachedlow, block.CacheHigh
+--    end
+--    ...
+--    block.CacheLow = low
+--    block.CacheHigh = high
+--    return low, high
+--end
+
+--self invalidating so nothing has to clear it 
 local function BlockBounds(block)
-    local cachedlow = block.CacheLow
-    if cachedlow ~= nil then
-        return cachedlow, block.CacheHigh
+    local cache = block.BoundsCache
+    if cache and cache.Position == block.Position and cache.Size == block.Size and cache.Shape == block.Shape then
+        return cache.Low, cache.High
     end
     local half = block.Size / 2
     local baselow = block.Position - half
@@ -312,8 +338,7 @@ local function BlockBounds(block)
     local planey = block.Position.y
     local low = if flat then V(baselow.x, planey, baselow.z) else baselow
     local high = if flat then V(basehigh.x, planey, basehigh.z) else basehigh
-    block.CacheLow = low
-    block.CacheHigh = high
+    block.BoundsCache = {Position = block.Position, Size = block.Size, Shape = block.Shape, Low = low, High = high}
     return low, high
 end
 
@@ -321,8 +346,9 @@ local function Collides(position)
     if not Engine.Collision then return false end
     local blocks = Engine.Blocks
     local floor = Engine.Floor
-    local minX, minY, minZ = position.x - playerRadius, position.y, position.z - playerRadius
-    local maxX, maxY, maxZ = position.x + playerRadius, position.y + playerHeight, position.z + playerRadius
+    local radius, height = Engine.PlayerRadius, Engine.PlayerHeight
+    local minX, minY, minZ = position.x - radius, position.y, position.z - radius
+    local maxX, maxY, maxZ = position.x + radius, position.y + height, position.z + radius
     if floor and minY < floor - 1e-4 then return true end
     for _, block in blocks do
         if block.CanCollide then
@@ -338,6 +364,8 @@ end
 local function Depenetrate(player)
     if not Engine.Collision then return end
     local blocks = Engine.Blocks
+    --out of the loop so we read them once
+    local radius, height = Engine.PlayerRadius, Engine.PlayerHeight
     for _ = 1, 4 do
         local position = player.Position
         local floor = Engine.Floor
@@ -345,8 +373,8 @@ local function Depenetrate(player)
             player.Position = V(position.x, floor, position.z)
             position = player.Position
         end
-        local minimum = V(position.x - playerRadius, position.y, position.z - playerRadius)
-        local maximum = V(position.x + playerRadius, position.y + playerHeight, position.z + playerRadius)
+        local minimum = V(position.x - radius, position.y, position.z - radius)
+        local maximum = V(position.x + radius, position.y + height, position.z + radius)
         local push = nil
         for _, block in blocks do
             if block.CanCollide then
@@ -516,10 +544,6 @@ end
 local function UpdateCamera(dt)
     local camera = Engine.Camera
     local turn, pitch = 0, 0
-    --if IsDown("Q", "Left", "LeftArrow", "ArrowLeft") then turn -= 1 end
-    --if IsDown("E", "Right", "RightArrow", "ArrowRight") then turn += 1 end
-    --if IsDown("Up", "UpArrow", "ArrowUp") then pitch += 1 end
-    --if IsDown("Down", "DownArrow", "ArrowDown") then pitch -= 1 end
     if isanydown(TURN_LEFT) then turn -= 1 end
     if isanydown(TURN_RIGHT) then turn += 1 end
     if isanydown(lookup) then pitch += 1 end
@@ -529,15 +553,26 @@ local function UpdateCamera(dt)
 
     if Engine.MouseLook and isrbxactive() then
         local mouse = getmouseposition()
-        local centerX, centerY = viewportWidth / 2, viewportHeight / 2
-        camera.Yaw += (mouse.x - centerX) * Engine.MouseSensitivity
-        camera.Pitch -= (mouse.y - centerY) * Engine.MouseSensitivity
-        local backX, backY = (centerX - mouse.x + .5) // 1, (centerY - mouse.y + .5) // 1
+        local centerX, centerY = math.floor(viewportWidth / 2), math.floor(viewportHeight / 2)
+        if mouseSettleTicks > 0 then
+            mouseSettleTicks -= 1
+        else
+            camera.Yaw += (mouse.x - centerX) * Engine.MouseSensitivity
+            camera.Pitch -= (mouse.y - centerY) * Engine.MouseSensitivity
+        end
+        local backX, backY = math.floor(centerX - mouse.x + .5), math.floor(centerY - mouse.y + .5)
         if backX ~= 0 or backY ~= 0 then
             mousemoverel(backX, backY)
         end
+    else
+        mouseSettleTicks = 3
     end
     camera.Pitch = math.clamp(camera.Pitch, -maxPitch, maxPitch)
+
+    --wider cull while turning so faces dont pop in just cautionary 
+    local turned = math.abs(camera.Yaw - (PreviousCamera.Yaw or camera.Yaw)) + math.abs(camera.Pitch - (PreviousCamera.Pitch or camera.Pitch))
+    turnRate = math.max(turned / math.max(dt, 1e-3), turnRate * math.exp(-dt * 4))
+    Engine.TurnMargin = math.min(math.rad(50), turnRate * (lastBuildSeconds + 1 / 60) * 1.5)
 
     local bFlyDown = IsDown("F")
     if bFlyDown and not bFlyHeld then
@@ -571,7 +606,6 @@ local function Update()
     local dt = math.min(rawDt, maxFrameTime)
     lastUpdate = now
 
-    --Keys = {}
     table.clear(Keys)
     table.clear(lowerkeys)
     if isrbxactive() then
@@ -592,7 +626,6 @@ local function Update()
     end
 
     --only call this when it change
-    --block_roblox_window(Engine.Active and Engine.BlockRobloxInput)
     local wantblock = Engine.Active and Engine.BlockRobloxInput
     if wantblock ~= lastblockinput then
         block_roblox_window(wantblock)
@@ -604,19 +637,14 @@ local function Update()
     local camera = Engine.Camera
     PreviousCamera.X, PreviousCamera.Y, PreviousCamera.Z = camera.X, camera.Y, camera.Z
     PreviousCamera.Yaw, PreviousCamera.Pitch = camera.Yaw, camera.Pitch
-    for _, block in Engine.Blocks do
-        block.PreviousPosition = block.Position
-        block.PreviousYaw = block.Yaw
-        block.CacheLow = nil
-        block.CacheHigh = nil
-    end
     tickStart = now
     tickLength = math.clamp(rawDt, 1 / 240, .1)
     updateCount += 1
     if Engine.Debug and now - lastDebugPrint >= 5 then
         local elapsed = now - lastDebugPrint
-        print(string.format("Hellgrid: Render %.1f/s, PreLocal %.1f/s, overlay fps %s", renderCount / elapsed, updateCount / elapsed, tostring(get_overlay_fps())))
+        print(string.format("Hellgrid: Render %.1f/s %.2fms avg, draw list %.1f/s %.2fms per build, PreLocal %.1f/s, %d faces, overlay fps %s", renderCount / elapsed, if renderCount > 0 then renderTime / renderCount * 1000 else 0, prepareCount / elapsed, if prepareCount > 0 then prepareTime / prepareCount * 1000 else 0, updateCount / elapsed, #DrawList, tostring(get_overlay_fps())))
         renderCount, updateCount, lastDebugPrint = 0, 0, now
+        renderTime, prepareCount, prepareTime = 0, 0, 0
     end
     UpdateCamera(dt)
     if Engine.OnUpdate then
@@ -624,9 +652,16 @@ local function Update()
     end
 end
 
---local View = {}
+--alpha is an arg now so this caches
+local function blendnumber(previous, current, alpha)
+    if previous == nil then return current end
+    return previous + (current - previous) * alpha
+end
 
---inlined into collect face now
+--the view locals up top replace these
+--local View = {}
+--local scratchCamera = {}
+
 --local function ToCamera(point)
 --    local dx, dy, dz = point.x - View.X, point.y - View.Y, point.z - View.Z
 --    local right = -dx * View.SinYaw + dz * View.CosYaw
@@ -634,53 +669,10 @@ end
 --    return right, dy * View.CosPitch - ahead * View.SinPitch, dy * View.SinPitch + ahead * View.CosPitch
 --end
 
---alpha is an arg now so this caches
-local function blendnumber(previous, current, alpha)
-    if previous == nil then return current end
-    return previous + (current - previous) * alpha
-end
-
-local function blendvector(previous, current, alpha)
-    if previous == nil then return current end
-    return previous + (current - previous) * alpha
-end
-
-local function acquirepoints()
-    poolpointindex += 1
-    local slot = pointpool[poolpointindex]
-    if slot == nil then
-        slot = table.create(cylinderSides + 2)
-        pointpool[poolpointindex] = slot
-    end
-    return slot
-end
-
-local function acquireitem()
-    poolitemindex += 1
-    local slot = itempool[poolitemindex]
-    if slot == nil then
-        slot = {Depth = 0, Points = false, Count = 0, Color = false, Outline = false}
-        itempool[poolitemindex] = slot
-    end
-    return slot
-end
-
-local function acquiregroup()
-    poolgroupindex += 1
-    local slot = grouppool[poolgroupindex]
-    if slot == nil then
-        slot = {Depth = 0, Items = table.create(16), Count = 0}
-        grouppool[poolgroupindex] = slot
-    end
-    slot.Count = 0
-    return slot
-end
-
---old one made a new table per point
---local function ClipNear(points)
+--this one allocates a table per point
+--local function ClipNear(points, count)
 --    local near = Engine.NearPlane
 --    local result = {}
---    local count = #points
 --    for index = 1, count do
 --        local a = points[index]
 --        local b = points[index % count + 1]
@@ -694,18 +686,19 @@ end
 --    return result
 --end
 
+--scratch buffers instead so nothing allocats
 local function ClipNear(count)
     local near = Engine.NearPlane
     local written = 0
     for index = 1, count do
         local nextindex = index % count + 1
         local az, bz = campointz[index], campointz[nextindex]
-        local ainside, binside = az >= near, bz >= near
-        if ainside then
+        local aInside, bInside = az >= near, bz >= near
+        if aInside then
             written += 1
             clippointx[written], clippointy[written], clippointz[written] = campointx[index], campointy[index], az
         end
-        if ainside ~= binside then
+        if aInside ~= bInside then
             local t = (near - az) / (bz - az)
             written += 1
             clippointx[written] = campointx[index] + (campointx[nextindex] - campointx[index]) * t
@@ -716,107 +709,251 @@ local function ClipNear(count)
     return written
 end
 
-local function CollectFace(block, template, position, cosYaw, sinYaw, cameraPosition)
-    local vertexcount = #template
-    local size = block.Size
-    local isPlane = block.Shape == "Plane"
-
-    --cull on 3 points first then transform the rest
-    for index = 1, 3 do
-        local scaled = template[index] * size
-        worldpoints[index] = V(scaled.x * cosYaw - scaled.z * sinYaw, scaled.y, scaled.x * sinYaw + scaled.z * cosYaw) + position
+local function BlockFaces(block)
+    local cache = block.FaceCache
+    if cache and cache.Position == block.Position and cache.Size == block.Size and cache.Yaw == block.Yaw and cache.Shape == block.Shape then
+        return cache.Faces
     end
 
-    local first = worldpoints[1]
-    local rawnormal = vector.cross(worldpoints[2] - first, worldpoints[3] - first)
-    local facing = vector.dot(rawnormal, cameraPosition - first)
-    if facing <= 0 and not isPlane then return nil, false end
-    if facing < 0 then rawnormal = -rawnormal end
-
-    local center = worldpoints[1] + worldpoints[2] + worldpoints[3]
-    for index = 4, vertexcount do
-        local scaled = template[index] * size
-        local world = V(scaled.x * cosYaw - scaled.z * sinYaw, scaled.y, scaled.x * sinYaw + scaled.z * cosYaw) + position
-        worldpoints[index] = world
-        center += world
+    local cosYaw, sinYaw = math.cos(block.Yaw), math.sin(block.Yaw)
+    local faces = {}
+    for _, template in Shapes[block.Shape] do
+        local points = {}
+        local center = vector.zero
+        for index = 1, #template do
+            local scaled = template[index] * block.Size
+            local world = V(scaled.x * cosYaw - scaled.z * sinYaw, scaled.y, scaled.x * sinYaw + scaled.z * cosYaw) + block.Position
+            points[index] = world
+            center += world
+        end
+        center /= #points
+        local radius = 0
+        for _, point in points do
+            radius = math.max(radius, vector.magnitude(point - center))
+        end
+        faces[#faces + 1] = {
+            Name = template.Name,
+            Points = points,
+            Center = center,
+            Radius = radius,
+            Normal = vector.normalize(vector.cross(points[2] - points[1], points[3] - points[1])),
+        }
     end
-    center /= vertexcount
+    block.FaceCache = {Position = block.Position, Size = block.Size, Yaw = block.Yaw, Shape = block.Shape, Faces = faces}
+    return faces
+end
 
-    local vx, vy, vz = viewx, viewy, viewz
-    local cosy, siny = viewcosyaw, viewsinyaw
-    local cosp, sinp = viewcospitch, viewsinpitch
-    for index = 1, vertexcount do
-        local point = worldpoints[index]
-        local dx, dy, dz = point.x - vx, point.y - vy, point.z - vz
-        local ahead = dx * cosy + dz * siny
-        campointx[index] = -dx * siny + dz * cosy
-        campointy[index] = dy * cosp - ahead * sinp
-        campointz[index] = dy * sinp + ahead * cosp
+--no upvalues so luau cache it for free
+local function depthgreater(a, b)
+    return a.Depth > b.Depth
+end
+
+local function PrepareFrame()
+    local buildStart = os.clock()
+    local sliceStart = buildStart
+    local camera = Engine.Camera
+    local cameraPosition = V(camera.X, camera.Y, camera.Z)
+    local cosYaw, sinYaw = math.cos(camera.Yaw), math.sin(camera.Yaw)
+    local cosPitch, sinPitch = math.cos(camera.Pitch), math.sin(camera.Pitch)
+    local halfFov = camera.Fov / 2
+    local margin = cullMargin + Engine.TurnMargin
+    local tanX = math.tan(math.min(halfFov + margin, math.rad(89)))
+    local tanY = math.tan(math.min(math.atan(math.tan(halfFov) * viewportHeight / viewportWidth) + margin, math.rad(89)))
+    local near = Engine.NearPlane
+    local blocks = table.clone(Engine.Blocks)
+    local ground = {}
+    local groups = {}
+
+    for index, block in blocks do
+        if index % 64 == 0 and os.clock() - sliceStart >= Engine.BuildBudget then
+            prepareTime += os.clock() - sliceStart
+            task.wait()
+            if not Running() then return end
+            sliceStart = os.clock()
+        end
+        if block.Visible then
+            local isPlane = block.Shape == "Plane"
+            local hidden = block.HiddenFaces
+            local items = {}
+            for _, face in BlockFaces(block) do
+                if not (hidden and face.Name and hidden[face.Name]) then
+                    local toCamera = cameraPosition - face.Center
+                    local facing = vector.dot(face.Normal, toCamera)
+                    local inView = false
+                    if facing > 0 or isPlane then
+                        local dx, dy, dz = -toCamera.x, -toCamera.y, -toCamera.z
+                        local ahead = dx * cosYaw + dz * sinYaw
+                        local reach = dy * sinPitch + ahead * cosPitch + face.Radius
+                        inView = reach > near
+                            and math.abs(-dx * sinYaw + dz * cosYaw) - face.Radius <= reach * tanX
+                            and math.abs(dy * cosPitch - ahead * sinPitch) - face.Radius <= reach * tanY
+                    end
+                    local depth = if inView then vector.magnitude(toCamera) else 0
+                    local amount = 0
+                    if inView and Engine.FogColor and not block.NoFog then
+                        amount = math.clamp(depth / Engine.FogDistance, 0, 1)
+                    end
+                    if inView and amount < .97 then
+                        if face.LightDirection ~= Engine.LightDirection or face.LightAmbient ~= Engine.Ambient then
+                            face.LightDirection, face.LightAmbient = Engine.LightDirection, Engine.Ambient
+                            face.Light = Engine.Ambient + (1 - Engine.Ambient) * math.max(0, vector.dot(face.Normal, Engine.LightDirection))
+                            face.BackLight = Engine.Ambient + (1 - Engine.Ambient) * math.max(0, vector.dot(-face.Normal, Engine.LightDirection))
+                        end
+                        local light = if block.Unlit then 1 else (if facing < 0 then face.BackLight else face.Light)
+                        local color = block.FaceColors and face.Name and block.FaceColors[face.Name] or block.Color
+                        local bOutline = not isPlane and depth <= Engine.OutlineDistance
+                        local fill, outline
+                        if Engine.FogColor then
+                            fill = CachedColor(color, light, amount)
+                            outline = if bOutline then CachedColor(color, light * .45, amount) else nil
+                        else
+                            local shade = light * (if block.NoFog then 1 else math.clamp(1 - depth / Engine.FogDistance, .1, 1))
+                            fill = CachedColor(color, shade, 0)
+                            outline = if bOutline then CachedColor(color, shade * .45, 0) else nil
+                        end
+                        local item = {Points = face.Points, Color = fill, Outline = outline, Block = block, Origin = block.Position}
+                        if isPlane then
+                            ground[#ground + 1] = item
+                        else
+                            items[#items + 1] = item
+                        end
+                    end
+                end
+            end
+            if #items > 0 then
+                local half = block.Size / 2
+                local nearest = vector.clamp(cameraPosition, block.Position - half, block.Position + half)
+                groups[#groups + 1] = {Depth = vector.magnitude(cameraPosition - nearest) - (block.DepthBias or 0), Items = items}
+            end
+        end
     end
 
-    local clipped = ClipNear(vertexcount)
-    if clipped < 3 then return nil, false end
+    table.sort(groups, depthgreater)
+    for _, group in groups do
+        for _, item in group.Items do
+            ground[#ground + 1] = item
+        end
+    end
+    DrawList = ground
+    prepareTime += os.clock() - sliceStart
+    prepareCount += 1
+    lastBuildSeconds = os.clock() - buildStart
+end
 
-    local halfwidth, halfheight, focal = viewhalfwidth, viewhalfheight, viewfocal
-    local screen = acquirepoints()
+--this read manyy table fields per vertex
+--local function Project(point)
+--    local dx, dy, dz = point.x - View.X, point.y - View.Y, point.z - View.Z
+--    local ahead = dx * View.CosYaw + dz * View.SinYaw
+--    local depth = dy * View.SinPitch + ahead * View.CosPitch
+--    local scale = View.Focal / depth
+--    return View.HalfWidth + (-dx * View.SinYaw + dz * View.CosYaw) * scale, View.HalfHeight - (dy * View.CosPitch - ahead * View.SinPitch) * scale, depth
+--end
+
+local function Project(point)
+    local dx, dy, dz = point.x - viewx, point.y - viewy, point.z - viewz
+    local ahead = dx * viewcosyaw + dz * viewsinyaw
+    local depth = dy * viewsinpitch + ahead * viewcospitch
+    local scale = viewfocal / depth
+    return viewhalfwidth + (-dx * viewsinyaw + dz * viewcosyaw) * scale, viewhalfheight - (dy * viewcospitch - ahead * viewsinpitch) * scale, depth
+end
+
+local function DrawItem(item)
+    local near = Engine.NearPlane
+    local points = item.Points
+    local count = #points
+    local offset = item.Block.Position - item.Origin
+
+    if count == 4 then
+        local x1, y1, z1 = Project(points[1] + offset)
+        local x2, y2, z2 = Project(points[2] + offset)
+        local x3, y3, z3 = Project(points[3] + offset)
+        local x4, y4, z4 = Project(points[4] + offset)
+        if z1 >= near and z2 >= near and z3 >= near and z4 >= near then
+            if math.max(x1, x2, x3, x4) < 0 or math.min(x1, x2, x3, x4) > viewportWidth or math.max(y1, y2, y3, y4) < 0 or math.min(y1, y2, y3, y4) > viewportHeight then return end
+            local a, b, c, d = vector.create(x1, y1, 0), vector.create(x2, y2, 0), vector.create(x3, y3, 0), vector.create(x4, y4, 0)
+            DrawingImmediate.FilledQuad(a, b, c, d, item.Color, 1)
+            if Engine.Outlines and item.Outline then
+                DrawingImmediate.Quad(a, b, c, d, item.Outline, .8, 1)
+            end
+            return
+        end
+    end
+
+    --this made a table per vertex and a new screen array per face
+    --local cameraPoints = scratchCamera
+    --local bClip = false
+    --for index = 1, count do
+    --    local slot = cameraPoints[index]
+    --    if not slot then
+    --        slot = {0, 0, 0}
+    --        cameraPoints[index] = slot
+    --    end
+    --    local cx, cy, cz = ToCamera(points[index])
+    --    slot[1], slot[2], slot[3] = cx, cy, cz
+    --    if cz < near then bClip = true end
+    --end
+    --if bClip then
+    --    cameraPoints = ClipNear(cameraPoints, count)
+    --    count = #cameraPoints
+    --    if count < 3 then return end
+    --end
+    --local screen = table.create(count + 1)
+
+    --scratch buffers and one reused screen array instead
+    local bClip = false
+    for index = 1, count do
+        local point = points[index] + offset
+        local dx, dy, dz = point.x - viewx, point.y - viewy, point.z - viewz
+        local ahead = dx * viewcosyaw + dz * viewsinyaw
+        local cz = dy * viewsinpitch + ahead * viewcospitch
+        campointx[index] = -dx * viewsinyaw + dz * viewcosyaw
+        campointy[index] = dy * viewcospitch - ahead * viewsinpitch
+        campointz[index] = cz
+        if cz < near then bClip = true end
+    end
+
+    local srcx, srcy, srcz = campointx, campointy, campointz
+    if bClip then
+        count = ClipNear(count)
+        if count < 3 then return end
+        srcx, srcy, srcz = clippointx, clippointy, clippointz
+    end
+
+    local screen = screenscratch
     local left, right, top, bottom = math.huge, -math.huge, math.huge, -math.huge
-    for index = 1, clipped do
-        local invz = 1 / clippointz[index]
-        local sx = halfwidth + clippointx[index] * invz * focal
-        local sy = halfheight - clippointy[index] * invz * focal
-        screen[index] = Vector2.new(sx, sy)
+    for index = 1, count do
+        local invz = 1 / srcz[index]
+        local sx = viewhalfwidth + srcx[index] * invz * viewfocal
+        local sy = viewhalfheight - srcy[index] * invz * viewfocal
+        screen[index] = vector.create(sx, sy, 0)
         if sx < left then left = sx end
         if sx > right then right = sx end
         if sy < top then top = sy end
         if sy > bottom then bottom = sy end
     end
-    if right < 0 or left > viewportWidth or bottom < 0 or top > viewportHeight then
-        poolpointindex -= 1
-        return nil, false
-    end
+    if right < 0 or left > viewportWidth or bottom < 0 or top > viewportHeight then return end
 
-    --closes the loop so polyline dont need a clone
-    screen[clipped + 1] = screen[1]
-    --nil the tail or we draw old points
-    for index = #screen, clipped + 2, -1 do
-        screen[index] = nil
-    end
-
-    local toCamera = cameraPosition - center
-    local depth = vector.magnitude(toCamera)
-    local normal = vector.normalize(rawnormal)
-    local light = Engine.Ambient + (1 - Engine.Ambient) * math.max(0, vector.dot(normal, Engine.LightDirection))
-    local fog = math.clamp(1 - depth / Engine.FogDistance, .1, 1)
-    local color = block.FaceColors and template.Name and block.FaceColors[template.Name] or block.Color
-
-    local item = acquireitem()
-    item.Depth = depth
-    item.Points = screen
-    item.Count = clipped
-    item.Color = Rgb(color, light * fog)
-    item.Outline = if isPlane then false else Rgb(color, light * fog * .45)
-    return item, isPlane
-end
-
-local function DrawPolygon(item)
-    local points = item.Points
-    local count = item.Count
     if count == 4 then
-        DrawingImmediate.FilledQuad(points[1], points[2], points[3], points[4], item.Color, 1)
+        DrawingImmediate.FilledQuad(screen[1], screen[2], screen[3], screen[4], item.Color, 1)
     else
         for index = 2, count - 1 do
-            DrawingImmediate.FilledTriangle(points[1], points[index], points[index + 1], item.Color, 1)
+            DrawingImmediate.FilledTriangle(screen[1], screen[index], screen[index + 1], item.Color, 1)
         end
     end
-    local outline = item.Outline
-    if Engine.Outlines and outline then
-        --local loop = table.clone(points)
-        --loop[#loop + 1] = points[1]
-        DrawingImmediate.Polyline(points, outline, .8, 1)
+    if Engine.Outlines and item.Outline then
+        screen[count + 1] = screen[1]
+        for index = #screen, count + 2, -1 do
+            screen[index] = nil
+        end
+        DrawingImmediate.Polyline(screen, item.Outline, .8, 1)
     end
 end
 
 local function DrawBackground()
+    if not Engine.GroundColor then
+        DrawingImmediate.FilledRectangle(Vector2.new(0, 0), Vector2.new(viewportWidth, viewportHeight), Rgb(Engine.SkyColor, 1), 1, 0)
+        return
+    end
     local horizon = math.clamp(viewhalfheight + math.tan(viewpitch) * viewfocal, 0, viewportHeight)
     DrawingImmediate.FilledRectangle(Vector2.new(0, 0), Vector2.new(viewportWidth, horizon), Rgb(Engine.SkyColor, 1), 1, 0)
     local groundHeight = viewportHeight - horizon
@@ -827,23 +964,18 @@ local function DrawBackground()
     end
 end
 
---no upvalues so luau cache it for free
-local function depthgreater(a, b)
-    return a.Depth > b.Depth
-end
-
 local function Render()
     if not Running() or not Engine.Active then return end
+    local started = os.clock()
     renderCount += 1
-
-    poolpointindex = 0
-    poolitemindex = 0
-    poolgroupindex = 0
-    groundcount = 0
-    groupcount = 0
-
     local camera = Engine.Camera
     local alpha = math.clamp((os.clock() - tickStart) / tickLength, 0, 1)
+
+    --this made a closure every frame
+    --local function Blend(previous, current)
+    --    if previous == nil then return current end
+    --    return previous + (current - previous) * alpha
+    --end
 
     viewx = blendnumber(PreviousCamera.X, camera.X, alpha)
     viewy = blendnumber(PreviousCamera.Y, camera.Y, alpha)
@@ -856,69 +988,30 @@ local function Render()
     viewfocal = viewhalfwidth / math.tan(camera.Fov / 2)
 
     DrawBackground()
-
-    local cameraPosition = V(viewx, viewy, viewz)
-    for _, block in Engine.Blocks do
-        if block.Visible then
-            local position = blendvector(block.PreviousPosition, block.Position, alpha)
-            local blockYaw = blendnumber(block.PreviousYaw, block.Yaw, alpha)
-            local cosYaw, sinYaw = math.cos(blockYaw), math.sin(blockYaw)
-            local half = block.Size / 2
-            local nearest = vector.clamp(cameraPosition, position - half, position + half)
-            local group = acquiregroup()
-            group.Depth = vector.magnitude(cameraPosition - nearest)
-            local hidden = block.HiddenFaces
-            for _, template in Shapes[block.Shape] do
-                if not (hidden and template.Name and hidden[template.Name]) then
-                    local item, isPlane = CollectFace(block, template, position, cosYaw, sinYaw, cameraPosition)
-                    if item ~= nil then
-                        if isPlane then
-                            groundcount += 1
-                            groundlist[groundcount] = item
-                        else
-                            local slot = group.Count + 1
-                            group.Count = slot
-                            group.Items[slot] = item
-                        end
-                    end
-                end
-            end
-            if group.Count > 0 then
-                groupcount += 1
-                grouplist[groupcount] = group
-            else
-                poolgroupindex -= 1
-            end
-        end
+    for _, item in DrawList do
+        DrawItem(item)
     end
-
-    for index = 1, groundcount do
-        DrawPolygon(groundlist[index])
-    end
-
-    --sort reads # so the array must be exact
-    for index = #grouplist, groupcount + 1, -1 do
-        grouplist[index] = nil
-    end
-    table.sort(grouplist, depthgreater)
-    for index = 1, groupcount do
-        local group = grouplist[index]
-        local items = group.Items
-        for itemindex = 1, group.Count do
-            DrawPolygon(items[itemindex])
-        end
-    end
+    renderTime += os.clock() - started
 end
 
 local updateconnection = RunService.PreLocal:Connect(Update)
 local renderconnection = RunService.Render:Connect(Render)
 
---down here so it can see the connections
+local preparethread = task.spawn(function()
+    while Running() do
+        if Engine.Active then
+            PrepareFrame()
+        end
+        task.wait()
+    end
+end)
+
 function Engine.Stop()
     if Running() then
         _G.HellgridRun = runId + 1
         updateconnection:Disconnect()
         renderconnection:Disconnect()
+        task.cancel(preparethread)
         block_roblox_window(false)
     end
 end
